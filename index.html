@@ -964,28 +964,42 @@ const Auth = {
       const meta = authUser.user_metadata || {};
       const full_name = fallbackName || meta.full_name || authUser.email?.split('@')[0] || 'Designer';
       const username = (meta.username || full_name.toLowerCase().replace(/[^a-z0-9]+/g, '.').replace(/^\.|\.$/g, '')).slice(0, 30) || ('designer.' + authUser.id.slice(0, 8));
-      const ins = await KD_SUPABASE.from('profiles').upsert({ id: authUser.id, full_name, username, role: meta.role || 'designer' }, { onConflict: 'id' }).select().single();
-      if (ins.error) throw new Error('profile');
+      const role = ['designer', 'studio', 'client'].includes(meta.role) ? meta.role : 'designer';
+      const now = new Date().toISOString();
+      const ins = await KD_SUPABASE.from('profiles').upsert({
+        id: authUser.id, full_name, username, bio: '', role,
+        created_at: authUser.created_at || now, updated_at: now
+      }, { onConflict: 'id' }).select().single();
+      if (ins.error) { console.error('Profile creation failed:', ins.error.message); throw new Error('profile'); }
       row = ins.data;
     }
     const u = { id: authUser.id, email: authUser.email || '', name: row.full_name || fallbackName || 'Designer',
-      username: row.username || '', type: row.role || 'designer', onboarded: true, createdAt: Date.parse(row.created_at || authUser.created_at || new Date().toISOString()),
-      profile: { bio: row.bio || '', avatar: row.avatar_url || '', cover: row.cover_url || '', website: row.website || '', instagram: row.instagram || '', role: row.role || 'designer' } };
+      username: row.username || '', type: row.role || 'designer', interests: Array.isArray(row.interests) ? row.interests : [], onboarded: true, createdAt: Date.parse(row.created_at || authUser.created_at || new Date().toISOString()),
+      profile: { bio: row.bio || '', avatar: row.avatar_url || '', cover: row.cover_url || '', website: row.website || '', instagram: row.instagram || '', role: row.job_title || '', location: row.location || '', availability: row.availability || '', skills: Array.isArray(row.skills) ? row.skills : [], services: Array.isArray(row.services) ? row.services : [], experience: row.experience || '', awards: row.awards || '', publicEmail: !!row.public_email } };
     Store.set('session', u.id); this.save(u); return u;
   },
   async signIn(email, pw) {
     if (!KD_SUPABASE) throw new Error('backend');
     const { data, error } = await KD_SUPABASE.auth.signInWithPassword({ email: email.trim().toLowerCase(), password: pw });
-    if (error) throw new Error(/invalid login credentials/i.test(error.message) ? 'credentials' : 'backend');
+    if (error) {
+      console.error('Supabase sign-in failed:', error.message, error.status || '');
+      if (/invalid login credentials/i.test(error.message)) throw new Error('credentials');
+      if (/email not confirmed/i.test(error.message) || error.code === 'email_not_confirmed') throw new Error('unconfirmed');
+      throw new Error('backend');
+    }
     return this.profileFor(data.user);
   },
-  async signUp(name, email, pw) {
+  async signUp(name, email, pw, accountType = 'designer') {
     if (!KD_SUPABASE) throw new Error('backend');
     email = email.trim().toLowerCase(); name = name.trim();
     if (RESERVED_NAMES.test(name)) throw new Error('reserved');
+    const role = ['designer', 'studio', 'client'].includes(accountType) ? accountType : 'designer';
     const username = name.toLowerCase().replace(/[^a-z0-9]+/g, '.').replace(/^\.|\.$/g, '').slice(0, 30) || ('designer.' + Math.random().toString(36).slice(2, 8));
-    const { data, error } = await KD_SUPABASE.auth.signUp({ email, password: pw, options: { data: { full_name: name, username, role: 'designer' } } });
-    if (error) throw new Error(/already registered|already exists/i.test(error.message) ? 'exists' : 'backend');
+    const { data, error } = await KD_SUPABASE.auth.signUp({ email, password: pw, options: { data: { full_name: name, username, role } } });
+    if (error) {
+      console.error('Supabase sign-up failed:', error.message, error.status || '');
+      throw new Error(/already registered|already exists/i.test(error.message) ? 'exists' : 'backend');
+    }
     if (!data.user) throw new Error('backend');
     if (!data.session) throw new Error('confirmemail');
     return this.profileFor(data.user, name);
@@ -1000,6 +1014,11 @@ const Auth = {
 /* Restore Supabase session and load published portfolio projects into the existing UI cache. */
 (async function initCloudBackend() {
   if (!KD_SUPABASE) { console.error('Supabase SDK failed to load.'); return; }
+  KD_SUPABASE.auth.onAuthStateChange((event) => {
+    if (event === 'PASSWORD_RECOVERY') {
+      if (location.hash !== '#/reset-password') location.hash = '#/reset-password';
+    }
+  });
   try {
     const { data } = await KD_SUPABASE.auth.getSession();
     if (data.session?.user) await Auth.profileFor(data.session.user).catch(console.error);
@@ -1271,7 +1290,54 @@ function openAuth(mode = 'signin', reason = '') {
 ACT['auth-tab'] = el => openAuth(el.dataset.mode);
 ACT['open-signin'] = () => openAuth('signin');
 ACT['open-signup'] = () => openAuth('signup');
-ACT.forgot = () => Modal.open({ title: t('forgot'), body: `<p>${esc(t('forgotInfo'))}</p>`, foot: `<button class="btn" data-act="modal-close">${esc(t('close'))}</button>` });
+ACT.forgot = () => Modal.open({ title: t('forgot'), body: `
+  <p class="muted" style="margin-bottom:var(--s4)">Enter the email address you used for your KURDHANCE account. We will send a password reset link if the account exists.</p>
+  <form data-form="forgot-password" novalidate>
+    ${field({ name: 'email', label: t('email'), type: 'email', req: true, auto: 'email' })}
+    <span class="err" data-for="form" style="display:block;margin-bottom:var(--s3)"></span>
+    <button class="btn btn--primary" type="submit" style="width:100%">Send reset link</button>
+  </form>`, foot: `<button class="btn" data-act="modal-close">${esc(t('close'))}</button>` });
+
+FORMS['forgot-password'] = async f => {
+  clearErrs(f);
+  const email = fval(f, 'email'), btn = $('[type=submit]', f);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) { setErr(f, 'email', t('errEmail')); return; }
+  if (!KD_SUPABASE) { setErr(f, 'form', 'Supabase is not available. Please try again later.'); return; }
+  busy(btn, true);
+  try {
+    const redirectTo = window.location.origin + window.location.pathname + '?auth=reset';
+    const { error } = await KD_SUPABASE.auth.resetPasswordForEmail(email.trim().toLowerCase(), { redirectTo });
+    if (error) { console.error('Password reset request failed:', error.message); throw new Error('reset_failed'); }
+    Modal.close();
+    toast('If an account exists for this email, a password reset link has been sent.', 'ok');
+  } catch (e) {
+    busy(btn, false);
+    setErr(f, 'form', 'Could not send the reset email. Check Supabase email/SMTP settings and allowed redirect URLs.');
+  }
+};
+
+FORMS['reset-password'] = async f => {
+  clearErrs(f);
+  const pw = f.elements.password?.value || '', confirm = f.elements.confirmPassword?.value || '', btn = $('[type=submit]', f);
+  if (pw.length < 8) { setErr(f, 'password', 'Use at least 8 characters.'); return; }
+  if (pw !== confirm) { setErr(f, 'confirmPassword', 'The passwords do not match.'); return; }
+  if (!KD_SUPABASE) { setErr(f, 'form', 'Supabase is not available.'); return; }
+  busy(btn, true);
+  try {
+    const { data } = await KD_SUPABASE.auth.getSession();
+    if (!data.session) throw new Error('recovery_session_missing');
+    const { error } = await KD_SUPABASE.auth.updateUser({ password: pw });
+    if (error) throw error;
+    await KD_SUPABASE.auth.signOut();
+    Store.del('session');
+    toast('Password updated. Please sign in with your new password.', 'ok');
+    location.hash = '#/';
+    setTimeout(() => openAuth('signin'), 100);
+  } catch (e) {
+    console.error('Password update failed:', e.message || e);
+    setErr(f, 'form', 'The reset link may have expired. Request a new password reset email and try again.');
+  } finally { busy(btn, false); }
+};
 
 FORMS.auth = async f => {
   clearErrs(f);
@@ -1285,7 +1351,7 @@ FORMS.auth = async f => {
   if (bad) { const first = $('[aria-invalid]', f); if (first) first.focus(); return; }
   busy(btn, true);
   try {
-    const u = up ? await Auth.signUp(name, email, pw) : await Auth.signIn(email, pw);
+    const u = up ? await Auth.signUp(name, email, pw, fval(f, 'type') || 'designer') : await Auth.signIn(email, pw);
     if (up) { u.type = fval(f, 'type') || 'designer'; Auth.save(u); }
     Modal.close(); refreshHeader(); toast(t(up ? 'welcomeNew' : 'welcomeBack', { name: u.name }), 'ok');
     if (up) openOnboarding(); else { const p = PENDING; PENDING = null; route(); if (p) p(); }
@@ -1295,6 +1361,7 @@ FORMS.auth = async f => {
     const msg = e.message === 'confirmemail' ? 'Account created. Confirm your email in your inbox, then sign in.' :
       e.message === 'backend' ? 'Supabase request failed. Check your project URL, publishable key, Auth settings, and network.' :
       e.message === 'profile' ? 'Account exists, but profile creation failed. Check the profiles table and RLS policies.' :
+      e.message === 'unconfirmed' ? 'Please confirm your email using the link we sent before signing in. If no email arrived, check SMTP settings.' :
       t(m || 'errGeneric');
     setErr(f, 'form', msg);
   }
@@ -1314,10 +1381,15 @@ function openOnboarding() {
   });
 }
 ACT['chip-toggle'] = el => el.setAttribute('aria-pressed', el.getAttribute('aria-pressed') !== 'true');
-FORMS.onboard = f => {
+FORMS.onboard = async f => {
   const u = Auth.user; if (!u) return;
-  u.interests = $$('#onbChips [aria-pressed=true]', f).map(b => b.dataset.id);
-  u.profile = { ...(u.profile || {}), role: fval(f, 'role'), bio: fval(f, 'bio') }; u.onboarded = true; Auth.save(u);
+  const interests = $$('#onbChips [aria-pressed=true]', f).map(b => b.dataset.id);
+  const jobTitle = fval(f, 'role'), bio = fval(f, 'bio');
+  if (KD_SUPABASE && Auth.uid) {
+    const { error } = await KD_SUPABASE.from('profiles').update({ job_title: jobTitle, bio, interests, updated_at: new Date().toISOString() }).eq('id', Auth.uid);
+    if (error) { console.error('Onboarding profile sync failed:', error.message); toast('Your profile could not be synced. Check the profile SQL migration and RLS policies.', 'err'); return; }
+  }
+  u.interests = interests; u.profile = { ...(u.profile || {}), role: jobTitle, bio }; u.onboarded = true; Auth.save(u);
   Modal.close(); toast(t('saved'), 'ok');
 };
 
@@ -1370,8 +1442,18 @@ ACT.copylink = async el => toast((await copyText(shareUrl(el.dataset.path))) ? t
 /* --- router.js --- */
 /* ============ router.js: hash router, page meta/SEO, language and theme ============ */
 const P = {};   // page renderers: P.name = (params, query) => html ; optional P.name.after = (params, query) => {}
+P.resetPassword = () => {
+  setMeta({ title: 'Reset password · KURDHANCE', noindex: true });
+  return `<section class="wrap page" style="max-width:560px"><div class="card" style="padding:var(--s6)"><h1>Choose a new password</h1><p class="muted" style="margin:var(--s3) 0 var(--s5)">Enter a new password for your KURDHANCE account.</p>
+    <form data-form="reset-password" novalidate>
+      ${field({ name: 'password', label: 'New password', type: 'password', req: true, auto: 'new-password' })}
+      ${field({ name: 'confirmPassword', label: 'Confirm new password', type: 'password', req: true, auto: 'new-password' })}
+      <span class="err" data-for="form" style="display:block;margin-bottom:var(--s3)"></span>
+      <button class="btn btn--primary btn--lg" type="submit" style="width:100%">Update password</button>
+    </form></div></section>`;
+};
 const ROUTES = [
-  ['/', 'home'], ['/explore', 'explore'], ['/categories', 'categories'], ['/project/:id', 'project'], ['/designers', 'designers'], ['/u/:id', 'profile'],
+  ['/', 'home'], ['/reset-password', 'resetPassword'], ['/explore', 'explore'], ['/categories', 'categories'], ['/project/:id', 'project'], ['/designers', 'designers'], ['/u/:id', 'profile'],
   ['/hire', 'hire'], ['/jobs', 'jobs'], ['/job/:id', 'job'], ['/awards', 'awards'], ['/saved', 'saved'], ['/collections', 'collections'], ['/collection/:id', 'collection'],
   ['/create', 'create'], ['/edit/:id', 'edit'], ['/manage', 'manage'], ['/dashboard', 'dashboard'], ['/messages', 'messages'], ['/notifications', 'notifications'],
   ['/settings', 'settings'], ['/admin', 'admin'], ['/about', 'about'], ['/contact', 'contact'], ['/help', 'help'], ['/privacy', 'privacy'], ['/terms', 'terms'],
@@ -2283,8 +2365,23 @@ P.settings = () => {
 ACT['theme-set'] = el => setTheme(el.dataset.v);
 document.addEventListener('change', async e => {
   const el = e.target.closest && e.target.closest('[data-upload]'); if (!el || !el.files[0]) return;
-  try { const r = await readImage(el.files[0], el.dataset.upload === 'cover' ? 1400 : 420, .84); saveProfile({ [el.dataset.upload]: r.src }); toast(t('saved'), 'ok'); refreshHeader(); route(true); }
-  catch (er) { toast(t(er.message === 'size' ? 'errImgSize' : er.message === 'type' ? 'errImgType' : 'errImgRead'), 'err'); }
+  const kind = el.dataset.upload, file = el.files[0];
+  if (!KD_SUPABASE || !Auth.uid) { toast('Sign in with your KURDHANCE account before uploading a profile image.', 'err'); return; }
+  if (!/^image\/(jpeg|png|webp|gif|avif)$/.test(file.type) || file.size > 10 * 1024 * 1024) { toast(file.size > 10 * 1024 * 1024 ? 'Image must be 10 MB or smaller.' : 'Use a JPG, PNG, WEBP, GIF, or AVIF image.', 'err'); return; }
+  try {
+    const ext = (file.name.split('.').pop() || 'img').toLowerCase().replace(/[^a-z0-9]/g, '') || 'img';
+    const path = `${Auth.uid}/profile-${kind}-${crypto.randomUUID()}.${ext}`;
+    const { error: uploadError } = await KD_SUPABASE.storage.from('portfolio-media').upload(path, file, { upsert: false, contentType: file.type, cacheControl: '31536000' });
+    if (uploadError) throw new Error('storage:' + uploadError.message);
+    const { data: publicData } = KD_SUPABASE.storage.from('portfolio-media').getPublicUrl(path);
+    const url = publicData.publicUrl, col = kind === 'avatar' ? 'avatar_url' : 'cover_url';
+    const { error: dbError } = await KD_SUPABASE.from('profiles').update({ [col]: url, updated_at: new Date().toISOString() }).eq('id', Auth.uid);
+    if (dbError) throw new Error('database:' + dbError.message);
+    saveProfile({ [kind]: url }); toast(t('saved'), 'ok'); refreshHeader(); route(true);
+  } catch (er) {
+    console.error('Profile image upload failed:', er.message || er);
+    toast(er.message?.startsWith('storage:') ? 'Image upload failed. Check portfolio-media storage policies.' : 'Image could not be saved to your profile. Check profiles table and RLS policies.', 'err');
+  } finally { el.value = ''; }
 });
 FORMS.settings = async f => {
   clearErrs(f); const u = Auth.user; let bad = false;
@@ -2304,8 +2401,19 @@ FORMS.settings = async f => {
       username: patch.username || u.username,
       full_name: name,
       bio: patch.bio || '',
+      job_title: patch.role || null,
+      location: patch.location || null,
       website: patch.website || null,
       instagram: patch.instagram || null,
+      availability: patch.availability || null,
+      skills: patch.skills || [],
+      services: patch.services || [],
+      experience: patch.experience || null,
+      awards: patch.awards || null,
+      public_email: !!patch.publicEmail,
+      interests: u.interests || [],
+      avatar_url: u.profile?.avatar || null,
+      cover_url: u.profile?.cover || null,
       role: ['designer','studio','client'].includes(u.type) ? u.type : 'designer',
       updated_at: new Date().toISOString()
     }).eq('id', Auth.uid);
